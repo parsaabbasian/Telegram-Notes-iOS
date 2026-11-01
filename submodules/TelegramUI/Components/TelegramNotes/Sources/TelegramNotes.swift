@@ -11,38 +11,27 @@ public struct TelegramNote: Equatable {
     public let text: String
     public let timestamp: Int32
     public let expirationTimestamp: Int32
+    public var isSpoiler: Bool = false
+    public var isRevealed: Bool = false
+    public var poll: TelegramNotePoll? = nil
+    public var audience: TelegramNoteAudience = .contacts
+    public var reaction: String? = nil
+
+    public func fractionLeft(now: Int32) -> CGFloat {
+        return TelegramNoteTimer.fractionLeft(timestamp: self.timestamp, expiration: self.expirationTimestamp, now: now)
+    }
 }
 
-// A Note is a contacts-only Story whose caption starts with the prefix, so any Telegram client can read it.
-public enum TelegramNoteCaption {
-    public static let prefix = "📝 Note · "
-    public static let maxLength = 80
-    public static let period: Int32 = 24 * 60 * 60
-    public static let imageSize = CGSize(width: 1080.0, height: 1920.0)
-
-    public static func caption(text: String) -> String {
-        return self.prefix + text
-    }
-
-    public static func noteText(caption: String) -> String? {
-        guard caption.hasPrefix(self.prefix) else {
-            return nil
+public extension TelegramNoteAudience {
+    var title: String {
+        switch self {
+        case .contacts:
+            return TelegramNotesStrings.string("NotesAudienceContacts")
+        case .closeFriends:
+            return TelegramNotesStrings.string("NotesAudienceCloseFriends")
+        case let .folder(_, title):
+            return title
         }
-        let text = String(caption.dropFirst(self.prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
-    }
-
-    // Length is counted in UTF-16 units, so an emoji fits only when its whole sequence fits.
-    public static func length(_ text: String) -> Int {
-        return text.utf16.count
-    }
-
-    public static func validated(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty || self.length(trimmed) > self.maxLength {
-            return nil
-        }
-        return trimmed
     }
 }
 
@@ -72,16 +61,34 @@ public final class TelegramNotesStore {
     private var peerContexts: [EnginePeer.Id: (context: PeerExpiringStoryListContext, disposable: Disposable)] = [:]
     private var rawNotes: [EnginePeer.Id: TelegramNote] = [:]
     private var demoNote: TelegramNote?
+    private var demoNoteSerial: Int32 = -100
     // The concept prototype keeps Notes on the device, so it needs neither Premium nor a server.
     public static let isDemoMode = true
 
     // Fictional sample contacts for the concept demo. They exist only in memory on this device.
-    private static let demoContacts: [(id: Int64, firstName: String, note: String)] = [
-        (9000000001, "Mia", "Lunch? 🍜"),
-        (9000000002, "Leo", "Demo 🚀"),
-        (9000000003, "Sara", "Lisbon 🌊"),
-        (9000000004, "Noah", "Gym 💪")
+    private struct DemoContact {
+        let id: Int64
+        let firstName: String
+        let note: String
+        let period: Int32
+        let elapsed: Int32
+        var isSpoiler: Bool = false
+        var poll: TelegramNotePoll? = nil
+        var audience: TelegramNoteAudience = .contacts
+    }
+
+    private static let demoStart = Int32(Date().timeIntervalSince1970)
+
+    private static let demoContacts: [DemoContact] = [
+        DemoContact(id: 9000000001, firstName: "Mia", note: "Lunch? 🍜", period: 1 * 60 * 60, elapsed: 20 * 60, audience: .closeFriends),
+        DemoContact(id: 9000000002, firstName: "Leo", note: "Coding 💻", period: 24 * 60 * 60, elapsed: 16 * 60 * 60),
+        DemoContact(id: 9000000003, firstName: "Sara", note: "Won! 🎉", period: 8 * 60 * 60, elapsed: 3 * 60 * 60, isSpoiler: true),
+        DemoContact(id: 9000000004, firstName: "Noah", note: "🍕 or 💪?", period: 72 * 60 * 60, elapsed: 60 * 60 * 60, poll: TelegramNotePoll(options: ["Pizza 🍕", "Gym 💪"], votes: [14, 9]))
     ]
+
+    private static func demoPeerId(_ id: Int64) -> EnginePeer.Id {
+        return EnginePeer.Id(namespace: Namespaces.Peer.CloudUser, id: EnginePeer.Id.Id._internalFromInt64Value(id))
+    }
 
     // Emoji avatars in the style of Telegram's emoji profile photos, so no real person's picture is used.
     private static let demoAvatarStyles: [Int64: (emoji: String, top: UInt32, bottom: UInt32)] = [
@@ -138,7 +145,7 @@ public final class TelegramNotesStore {
 
     public static var demoContactPeers: [EnginePeer] {
         return self.demoContacts.map { contact in
-            return EnginePeer(TelegramUser(id: EnginePeer.Id(namespace: Namespaces.Peer.CloudUser, id: EnginePeer.Id.Id._internalFromInt64Value(contact.id)), accessHash: nil, firstName: contact.firstName, lastName: nil, username: nil, phone: nil, photo: [], botInfo: nil, restrictionInfo: nil, flags: [], emojiStatus: nil, usernames: [], storiesHidden: nil, nameColor: nil, backgroundEmojiId: nil, profileColor: nil, profileBackgroundEmojiId: nil, subscriberCount: nil, verificationIconFileId: nil, linkedCommunityId: nil))
+            return EnginePeer(TelegramUser(id: self.demoPeerId(contact.id), accessHash: nil, firstName: contact.firstName, lastName: nil, username: nil, phone: nil, photo: [], botInfo: nil, restrictionInfo: nil, flags: [], emojiStatus: nil, usernames: [], storiesHidden: nil, nameColor: nil, backgroundEmojiId: nil, profileColor: nil, profileBackgroundEmojiId: nil, subscriberCount: nil, verificationIconFileId: nil, linkedCommunityId: nil))
         }
     }
     private var expiryTimer: SwiftSignalKit.Timer?
@@ -151,6 +158,13 @@ public final class TelegramNotesStore {
         return self.notesPromise.get()
     }
 
+    // Moves on once a minute, so a countdown ring keeps up while nothing else changes.
+    private var minutesElapsed: Int32 = 0
+    private let minuteTickPromise = ValuePromise<Int32>(0, ignoreRepeated: true)
+    public var minuteTickSignal: Signal<Int32, NoError> {
+        return self.minuteTickPromise.get()
+    }
+
     public private(set) var publishState: PublishState = .idle
     private let publishStatePromise = ValuePromise<PublishState>(.idle, ignoreRepeated: true)
     public var publishStateSignal: Signal<PublishState, NoError> {
@@ -159,6 +173,9 @@ public final class TelegramNotesStore {
 
     // Set by the chat list, which owns the presentation context for the composer.
     public var openComposer: (() -> Void)?
+    public var openNoteCard: ((EnginePeer) -> Void)?
+    // The account's bubble in the row, which a shared Note flies to.
+    public weak var accountBubbleView: UIView?
 
     public var accountNote: TelegramNote? {
         return self.notes[self.context.account.peerId]
@@ -186,7 +203,12 @@ public final class TelegramNotesStore {
         })
 
         self.expiryTimer = SwiftSignalKit.Timer(timeout: 60.0, repeat: true, completion: { [weak self] in
-            self?.recompute()
+            guard let self else {
+                return
+            }
+            self.recompute()
+            self.minutesElapsed += 1
+            self.minuteTickPromise.set(self.minutesElapsed)
         }, queue: .mainQueue())
         self.expiryTimer?.start()
     }
@@ -238,11 +260,27 @@ public final class TelegramNotesStore {
             notes[demoNote.peerId] = demoNote
         }
         if TelegramNotesStore.isDemoMode {
+            let start = TelegramNotesStore.demoStart
             for (index, contact) in TelegramNotesStore.demoContacts.enumerated() {
-                let peerId = EnginePeer.Id(namespace: Namespaces.Peer.CloudUser, id: EnginePeer.Id.Id._internalFromInt64Value(contact.id))
-                notes[peerId] = TelegramNote(peerId: peerId, storyId: Int32(-2 - index), text: contact.note, timestamp: now - Int32(index) * 600, expirationTimestamp: now + TelegramNoteCaption.period)
+                let peerId = TelegramNotesStore.demoPeerId(contact.id)
+                let timestamp = start - contact.elapsed
+                var note = TelegramNote(peerId: peerId, storyId: Int32(-2 - index), text: contact.note, timestamp: timestamp, expirationTimestamp: timestamp + contact.period)
+                note.isSpoiler = contact.isSpoiler
+                note.poll = contact.poll
+                note.audience = contact.audience
+                notes[peerId] = note
             }
         }
+        for (peerId, note) in notes {
+            var updated = note
+            updated.isRevealed = self.revealedNoteIds.contains(note.storyId)
+            updated.reaction = self.reactions[note.storyId]
+            if let index = self.pollChoices[note.storyId], let poll = note.poll {
+                updated.poll = poll.voted(index: index)
+            }
+            notes[peerId] = updated
+        }
+        notes = notes.filter { $0.value.expirationTimestamp > now }
         self.notes = notes
         self.notesPromise.set(self.notes)
     }
@@ -257,6 +295,64 @@ public final class TelegramNotesStore {
         return self.seenBubbleStoryIds.insert(storyId).inserted
     }
 
+    // The countdown, reveal, vote and reaction state of Notes on this device.
+    private var revealedNoteIds = Set<Int32>()
+    private var reactions: [Int32: String] = [:]
+    private var pollChoices: [Int32: Int] = [:]
+
+    public func reveal(note: TelegramNote) {
+        if self.revealedNoteIds.insert(note.storyId).inserted {
+            self.recompute()
+        }
+    }
+
+    public func setReaction(_ reaction: String?, note: TelegramNote) {
+        self.reactions[note.storyId] = reaction
+        self.recompute()
+    }
+
+    public func vote(note: TelegramNote, index: Int) {
+        guard self.pollChoices[note.storyId] == nil else {
+            return
+        }
+        self.pollChoices[note.storyId] = index
+        self.recompute()
+    }
+
+    public var supportsNoteOptions: Bool {
+        return TelegramNotesStore.isDemoMode
+    }
+
+    // Contacts, Close Friends and the account's own chat folders. The prototype adds samples when it has no folders.
+    public func audienceOptions() -> Signal<[TelegramNoteAudience], NoError> {
+        return self.context.engine.peers.currentChatListFilters()
+        |> take(1)
+        |> map { filters -> [TelegramNoteAudience] in
+            var folders: [TelegramNoteAudience] = []
+            for filter in filters {
+                if case let .filter(id, title, _, _) = filter {
+                    folders.append(.folder(id: id, title: title.text))
+                }
+            }
+            if folders.isEmpty && TelegramNotesStore.isDemoMode {
+                folders = [.folder(id: -1, title: TelegramNotesStrings.string("NotesAudienceSampleFamily")), .folder(id: -2, title: TelegramNotesStrings.string("NotesAudienceSampleWork"))]
+            }
+            return [.contacts, .closeFriends] + folders
+        }
+    }
+
+    // The prototype's Note lands once its flight to the avatar is over.
+    public func landDemoNote(text: String, options: TelegramNoteOptions) {
+        let now = Int32(Date().timeIntervalSince1970)
+        self.demoNoteSerial -= 1
+        var note = TelegramNote(peerId: self.context.account.peerId, storyId: self.demoNoteSerial, text: text, timestamp: now, expirationTimestamp: now + options.period)
+        note.isSpoiler = options.isSpoiler
+        note.poll = options.poll
+        note.audience = options.audience
+        self.demoNote = note
+        self.recompute()
+    }
+
     public func publish(text: String, theme: PresentationTheme, completion: @escaping (Bool) -> Void) {
         guard let text = TelegramNoteCaption.validated(text), self.publishState != .publishing else {
             completion(false)
@@ -265,15 +361,6 @@ public final class TelegramNotesStore {
         if TelegramNotesStore.isDemoMode {
             // Prototype: the Note stays on this device. Nothing is uploaded and contacts see nothing.
             completion(true)
-            // The bubble pops in once the sheet is out of the way, so the moment can be seen.
-            Queue.mainQueue().after(0.6, { [weak self] in
-                guard let self else {
-                    return
-                }
-                let now = Int32(Date().timeIntervalSince1970)
-                self.demoNote = TelegramNote(peerId: self.context.account.peerId, storyId: -1, text: text, timestamp: now, expirationTimestamp: now + TelegramNoteCaption.period)
-                self.recompute()
-            })
             return
         }
         guard let data = TelegramNoteRenderer.render(text: text, theme: theme).jpegData(compressionQuality: 0.9) else {

@@ -1647,7 +1647,17 @@ public final class StoryPeerListComponent: Component {
                 } else {
                     label = "\(peer.compactDisplayTitle): \(note.text)"
                 }
-                return StoryPeerListItemComponent.Note(text: note.text, isPlaceholder: false, storyId: note.storyId, accessibilityLabel: label)
+                let isHiddenBySpoiler = note.isSpoiler && !note.isRevealed
+                return StoryPeerListItemComponent.Note(
+                    text: note.text,
+                    isPlaceholder: false,
+                    storyId: note.storyId,
+                    accessibilityLabel: isHiddenBySpoiler && !isAccount ? "\(peer.compactDisplayTitle): \(TelegramNotesStrings.string("NotesSpoilerNote"))" : label,
+                    isHiddenBySpoiler: isHiddenBySpoiler,
+                    // Outside demo mode a Note is a Story, so it keeps the Story ring.
+                    timeLeftFraction: TelegramNotesStore.isDemoMode ? note.fractionLeft(now: Int32(Date().timeIntervalSince1970)) : nil,
+                    reaction: note.reaction
+                )
             } else if isAccount {
                 let text = TelegramNotesStrings.string("NotesAdd")
                 return StoryPeerListItemComponent.Note(text: text, isPlaceholder: true, storyId: nil, accessibilityLabel: text)
@@ -1661,7 +1671,9 @@ public final class StoryPeerListComponent: Component {
             }
             if peer.id == component.context.account.peerId {
                 TelegramNotesStore.shared(context: component.context).openComposer?()
-            } else if !TelegramNotesStore.isDemoMode {
+            } else if TelegramNotesStore.isDemoMode {
+                TelegramNotesStore.shared(context: component.context).openNoteCard?(peer)
+            } else {
                 // A contact's Note is a Story, so it opens in the Story viewer with its reply composer.
                 component.peerAction(peer)
             }
@@ -1673,8 +1685,8 @@ public final class StoryPeerListComponent: Component {
             }
             let store = TelegramNotesStore.shared(context: component.context)
             let accountPeerId = component.context.account.peerId
-            self.notesDisposable = (store.notesSignal
-            |> deliverOnMainQueue).start(next: { [weak self] notes in
+            self.notesDisposable = (combineLatest(queue: .mainQueue(), store.notesSignal, store.minuteTickSignal)
+            |> deliverOnMainQueue).start(next: { [weak self] notes, _ in
                 guard let self else {
                     return
                 }

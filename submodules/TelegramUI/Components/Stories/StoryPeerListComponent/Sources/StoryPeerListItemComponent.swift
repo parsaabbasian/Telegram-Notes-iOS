@@ -1,5 +1,6 @@
 import Foundation
 import TelegramNotes
+import InvisibleInkDustNode
 import UIKit
 import Display
 import ComponentFlow
@@ -395,12 +396,18 @@ public final class StoryPeerListItemComponent: Component {
         public let isPlaceholder: Bool
         public let storyId: Int32?
         public let accessibilityLabel: String
+        public let isHiddenBySpoiler: Bool
+        public let timeLeftFraction: CGFloat?
+        public let reaction: String?
         
-        public init(text: String, isPlaceholder: Bool, storyId: Int32?, accessibilityLabel: String) {
+        public init(text: String, isPlaceholder: Bool, storyId: Int32?, accessibilityLabel: String, isHiddenBySpoiler: Bool = false, timeLeftFraction: CGFloat? = nil, reaction: String? = nil) {
             self.text = text
             self.isPlaceholder = isPlaceholder
             self.storyId = storyId
             self.accessibilityLabel = accessibilityLabel
+            self.isHiddenBySpoiler = isHiddenBySpoiler
+            self.timeLeftFraction = timeLeftFraction
+            self.reaction = reaction
         }
     }
     
@@ -518,6 +525,9 @@ public final class StoryPeerListItemComponent: Component {
         private let button: HighlightTrackingButton
         private let titleContainer: UIView
         private var noteBubble: StoryNoteBubbleView?
+        private var noteTimerTrackLayer: CAShapeLayer?
+        private var noteTimerLayer: CAShapeLayer?
+        private var noteReactionLabel: UILabel?
         private var demoAvatarView: UIImageView?
         
         fileprivate var composeLayer: StoryComposeLayer?
@@ -708,6 +718,12 @@ public final class StoryPeerListItemComponent: Component {
                     self.noteBubble = nil
                     noteBubble.removeFromSuperview()
                 }
+                self.noteTimerTrackLayer?.removeFromSuperlayer()
+                self.noteTimerTrackLayer = nil
+                self.noteTimerLayer?.removeFromSuperlayer()
+                self.noteTimerLayer = nil
+                self.noteReactionLabel?.removeFromSuperview()
+                self.noteReactionLabel = nil
                 return
             }
             
@@ -725,18 +741,179 @@ public final class StoryPeerListItemComponent: Component {
             
             noteBubble.update(note: note, theme: component.theme)
             let bubbleSize = noteBubble.measure(maxWidth: avatarFrame.width + 16.0)
-            // The bubble sits on the avatar's top edge, like a thought over the contact's head.
-            let bubbleCenter = CGPoint(x: avatarFrame.midX, y: avatarFrame.minY + bubbleSize.height * 0.5 - 8.0)
+            // The bubble rests on the avatar's top edge, so the face and the circle stay visible under it.
+            let bubbleCenter = CGPoint(x: avatarFrame.midX, y: avatarFrame.minY + bubbleSize.height * 0.5 - 15.0)
             noteBubble.bounds = CGRect(origin: CGPoint(), size: bubbleSize)
             transition.setPosition(view: noteBubble, position: bubbleCenter)
             transition.setScale(view: noteBubble, scale: effectiveScale)
             transition.setAlpha(view: noteBubble, alpha: component.expandedAlphaFraction)
             noteBubble.isUserInteractionEnabled = component.expandedAlphaFraction > 0.5
             
-            let textChanged = previousComponent?.note?.text != note.text
-            if (isNew || textChanged) && !note.isPlaceholder && !UIAccessibility.isReduceMotionEnabled {
-                noteBubble.layer.animateSpring(from: 0.2 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.7, damping: 30.0)
+            let isAccount = component.peer.id == component.context.account.peerId
+            if isAccount {
+                TelegramNotesStore.shared(context: component.context).accountBubbleView = noteBubble
             }
+            
+            self.updateNoteTimer(component: component, note: note, avatarFrame: avatarFrame)
+            self.updateNoteReaction(component: component, note: note, previousReaction: previousComponent?.note?.reaction, avatarFrame: avatarFrame)
+            
+            // A new story id means a new Note, even when its text is the same as the last one's.
+            let noteChanged = previousComponent?.note?.storyId != note.storyId
+            if (isNew || noteChanged) && !note.isPlaceholder && !UIAccessibility.isReduceMotionEnabled {
+                if isAccount && !isNew {
+                    noteBubble.layer.animateSpring(from: 0.7 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.8, damping: 22.0)
+                    self.playNoteLanding(avatarFrame: avatarFrame, color: component.theme.list.itemAccentColor)
+                } else {
+                    noteBubble.layer.animateSpring(from: 0.2 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.7, damping: 30.0)
+                }
+            }
+        }
+        
+        // The time a Note has left, drawn where a Story's ring would be. It runs out like a secret chat's timer.
+        private func updateNoteTimer(component: StoryPeerListItemComponent, note: StoryPeerListItemComponent.Note, avatarFrame: CGRect) {
+            guard let fraction = note.timeLeftFraction else {
+                self.noteTimerTrackLayer?.removeFromSuperlayer()
+                self.noteTimerTrackLayer = nil
+                self.noteTimerLayer?.removeFromSuperlayer()
+                self.noteTimerLayer = nil
+                return
+            }
+            let trackLayer: CAShapeLayer
+            let timerLayer: CAShapeLayer
+            if let currentTrack = self.noteTimerTrackLayer, let currentTimer = self.noteTimerLayer {
+                trackLayer = currentTrack
+                timerLayer = currentTimer
+            } else {
+                trackLayer = CAShapeLayer()
+                timerLayer = CAShapeLayer()
+                for layer in [trackLayer, timerLayer] {
+                    layer.fillColor = nil
+                    layer.lineWidth = 2.0
+                    layer.lineCap = .round
+                    self.avatarContent.layer.addSublayer(layer)
+                }
+                self.noteTimerTrackLayer = trackLayer
+                self.noteTimerLayer = timerLayer
+            }
+            let center = CGPoint(x: avatarFrame.width * 0.5, y: avatarFrame.height * 0.5)
+            let path = UIBezierPath(arcCenter: center, radius: avatarFrame.width * 0.5 + 3.0, startAngle: -.pi * 0.5, endAngle: .pi * 1.5, clockwise: true).cgPath
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            trackLayer.path = path
+            timerLayer.path = path
+            trackLayer.strokeColor = component.theme.list.itemSecondaryTextColor.withAlphaComponent(0.22).cgColor
+            timerLayer.strokeColor = component.theme.list.itemAccentColor.cgColor
+            timerLayer.strokeEnd = fraction
+            trackLayer.opacity = Float(component.expandedAlphaFraction)
+            timerLayer.opacity = Float(component.expandedAlphaFraction)
+            CATransaction.commit()
+        }
+        
+        private func updateNoteReaction(component: StoryPeerListItemComponent, note: StoryPeerListItemComponent.Note, previousReaction: String?, avatarFrame: CGRect) {
+            guard let reaction = note.reaction else {
+                self.noteReactionLabel?.removeFromSuperview()
+                self.noteReactionLabel = nil
+                return
+            }
+            let label: UILabel
+            if let current = self.noteReactionLabel {
+                label = current
+            } else {
+                label = UILabel()
+                label.font = UIFont.systemFont(ofSize: 12.0)
+                label.textAlignment = .center
+                label.layer.cornerRadius = 10.0
+                label.clipsToBounds = true
+                label.isUserInteractionEnabled = false
+                self.button.addSubview(label)
+                self.noteReactionLabel = label
+            }
+            label.text = reaction
+            label.backgroundColor = component.theme.rootController.navigationBar.opaqueBackgroundColor
+            label.frame = CGRect(x: avatarFrame.maxX - 17.0, y: avatarFrame.maxY - 17.0, width: 20.0, height: 20.0)
+            label.alpha = component.expandedAlphaFraction
+            if previousReaction != reaction && !UIAccessibility.isReduceMotionEnabled {
+                label.layer.animateSpring(from: 0.2 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.6, damping: 24.0)
+            }
+        }
+        
+        // The avatar takes the Note's weight, a ring spreads from it, and the timer draws itself in.
+        private func playNoteLanding(avatarFrame: CGRect, color: UIColor) {
+            let bounce = CAKeyframeAnimation(keyPath: "transform.scale")
+            bounce.values = [0.0, -0.1, 0.07, -0.02, 0.0]
+            bounce.keyTimes = [0.0, 0.2, 0.5, 0.78, 1.0]
+            bounce.isAdditive = true
+            bounce.duration = 0.6
+            self.avatarContent.layer.add(bounce, forKey: "noteLanding")
+            
+            if let timerLayer = self.noteTimerLayer {
+                let draw = CABasicAnimation(keyPath: "strokeEnd")
+                draw.fromValue = 0.0
+                draw.toValue = timerLayer.strokeEnd
+                draw.duration = 0.75
+                draw.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                timerLayer.add(draw, forKey: "noteLanding")
+            }
+            
+            let center = CGPoint(x: avatarFrame.midX, y: avatarFrame.midY)
+            let ripple = CAShapeLayer()
+            ripple.path = UIBezierPath(arcCenter: CGPoint(), radius: avatarFrame.width * 0.5 + 3.0, startAngle: 0.0, endAngle: .pi * 2.0, clockwise: true).cgPath
+            ripple.position = center
+            ripple.fillColor = nil
+            ripple.strokeColor = color.cgColor
+            ripple.lineWidth = 2.0
+            ripple.opacity = 0.0
+            self.button.layer.addSublayer(ripple)
+            
+            let rippleScale = CABasicAnimation(keyPath: "transform.scale")
+            rippleScale.fromValue = 1.0
+            rippleScale.toValue = 1.55
+            let rippleFade = CABasicAnimation(keyPath: "opacity")
+            rippleFade.fromValue = 0.85
+            rippleFade.toValue = 0.0
+            let rippleGroup = CAAnimationGroup()
+            rippleGroup.animations = [rippleScale, rippleFade]
+            rippleGroup.duration = 0.65
+            rippleGroup.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            ripple.add(rippleGroup, forKey: "ripple")
+            
+            let sparkleColors = [color, UIColor(red: 1.0, green: 0.78, blue: 0.28, alpha: 1.0), UIColor(red: 1.0, green: 0.42, blue: 0.62, alpha: 1.0)]
+            let sparkleCount = 12
+            var sparkles: [CALayer] = [ripple]
+            for index in 0 ..< sparkleCount {
+                let angle = CGFloat(index) / CGFloat(sparkleCount) * .pi * 2.0 + CGFloat.random(in: -0.12 ... 0.12)
+                let start = CGPoint(x: center.x + cos(angle) * avatarFrame.width * 0.5, y: center.y + sin(angle) * avatarFrame.width * 0.5)
+                let distance = avatarFrame.width * 0.5 + CGFloat.random(in: 18.0 ... 34.0)
+                let side = CGFloat.random(in: 3.0 ... 5.0)
+                let sparkle = CALayer()
+                sparkle.bounds = CGRect(x: 0.0, y: 0.0, width: side, height: side)
+                sparkle.cornerRadius = side * 0.5
+                sparkle.backgroundColor = sparkleColors[index % sparkleColors.count].cgColor
+                sparkle.position = start
+                sparkle.opacity = 0.0
+                self.button.layer.addSublayer(sparkle)
+                sparkles.append(sparkle)
+                
+                let move = CABasicAnimation(keyPath: "position")
+                move.fromValue = NSValue(cgPoint: start)
+                move.toValue = NSValue(cgPoint: CGPoint(x: center.x + cos(angle) * distance, y: center.y + sin(angle) * distance))
+                let shrink = CABasicAnimation(keyPath: "transform.scale")
+                shrink.fromValue = 1.0
+                shrink.toValue = 0.2
+                let fade = CAKeyframeAnimation(keyPath: "opacity")
+                fade.values = [1.0, 1.0, 0.0]
+                fade.keyTimes = [0.0, 0.55, 1.0]
+                let group = CAAnimationGroup()
+                group.animations = [move, shrink, fade]
+                group.duration = 0.7
+                group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                sparkle.add(group, forKey: "sparkle")
+            }
+            Queue.mainQueue().after(0.8, {
+                for layer in sparkles {
+                    layer.removeFromSuperlayer()
+                }
+            })
         }
         
         public func transitionView() -> UIView? {
@@ -790,6 +967,8 @@ public final class StoryPeerListItemComponent: Component {
             let avatarFrame = CGRect(origin: CGPoint(x: floor((availableSize.width - avatarSize.width) * 0.5) + (effectiveWidth - availableSize.width) * 0.5, y: 4.0), size: avatarSize)
             
             transition.setFrame(view: avatarNode.view, frame: CGRect(origin: CGPoint(), size: avatarFrame.size))
+            // The sample contacts have no profile for Telegram's context menu to open.
+            self.containerNode.isGestureEnabled = !(TelegramNotesStore.isDemoMode && component.note != nil)
             if let demoAvatarImage = TelegramNotesStore.demoAvatarImage(peerId: component.peer.id, accountPeerId: component.context.account.peerId) {
                 let demoAvatarView: UIImageView
                 if let current = self.demoAvatarView {
@@ -839,7 +1018,8 @@ public final class StoryPeerListItemComponent: Component {
             transition.setScale(view: self.avatarContainer, scale: scaledAvatarSize / avatarSize.width)
             transition.setScale(view: self.avatarBackgroundContainer, scale: scaledAvatarSize / avatarSize.width)
             
-            if component.peer.id == component.context.account.peerId && !component.hasItems && component.ringAnimation == nil {
+            // The add badge goes away once the account has a Note: the bubble is then the way to edit it.
+            if component.peer.id == component.context.account.peerId && !component.hasItems && component.ringAnimation == nil && component.note?.isPlaceholder != false {
                 self.indicatorColorSeenLayer.isHidden = true
                 self.indicatorColorUnseenLayer.isHidden = true
                 
@@ -1040,7 +1220,7 @@ public final class StoryPeerListItemComponent: Component {
                 if avatarLiveBadgeFrame.height > 4.0 {
                     avatarPath.addPath(UIBezierPath(roundedRect: avatarLiveBadgeFrame.insetBy(dx: -2.0, dy: -2.0), cornerRadius: avatarLiveBadgeFrame.height * 0.5).cgPath)
                 }
-            } else if component.peer.id == component.context.account.peerId && !component.hasItems && component.ringAnimation == nil {
+            } else if component.peer.id == component.context.account.peerId && !component.hasItems && component.ringAnimation == nil && component.note?.isPlaceholder != false {
                 let cutoutSize: CGFloat = 18.0 + UIScreenPixel * 2.0
                 avatarPath.addEllipse(in: CGRect(origin: CGPoint(x: avatarSize.width - cutoutSize + UIScreenPixel, y: avatarSize.height - 1.0 - cutoutSize + UIScreenPixel), size: CGSize(width: cutoutSize, height: cutoutSize)))
             } else if let mappedLeftCenter {
@@ -1284,6 +1464,8 @@ private final class StoryNoteBubbleView: UIControl {
     private let backgroundView = UIView()
     private let label = UILabel()
     private var isPlaceholder = false
+    private var dustNode: InvisibleInkDustNode?
+    private var dustColor: UIColor = .white
     
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1320,6 +1502,23 @@ private final class StoryNoteBubbleView: UIControl {
         self.label.text = note.text
         self.backgroundView.backgroundColor = theme.list.itemBlocksBackgroundColor
         self.label.textColor = note.isPlaceholder ? theme.list.itemSecondaryTextColor : theme.list.itemPrimaryTextColor
+        self.dustColor = theme.list.itemPrimaryTextColor
+        self.label.alpha = note.isHiddenBySpoiler ? 0.0 : 1.0
+        if note.isHiddenBySpoiler {
+            if self.dustNode == nil {
+                let dustNode = InvisibleInkDustNode(textNode: nil, enableAnimations: !UIAccessibility.isReduceMotionEnabled)
+                dustNode.isUserInteractionEnabled = false
+                self.addSubview(dustNode.view)
+                self.dustNode = dustNode
+            }
+        } else if let dustNode = self.dustNode {
+            self.dustNode = nil
+            UIView.animate(withDuration: 0.25, animations: {
+                dustNode.view.alpha = 0.0
+            }, completion: { _ in
+                dustNode.view.removeFromSuperview()
+            })
+        }
         self.accessibilityLabel = note.accessibilityLabel
     }
     
@@ -1329,6 +1528,12 @@ private final class StoryNoteBubbleView: UIControl {
         self.backgroundView.frame = CGRect(origin: CGPoint(), size: size)
         self.backgroundView.layer.cornerRadius = size.height * 0.5
         self.label.frame = CGRect(origin: CGPoint(), size: size).insetBy(dx: 5.0, dy: 0.0)
+        if let dustNode = self.dustNode {
+            let dustFrame = self.label.frame.insetBy(dx: 0.0, dy: 3.0)
+            let rect = CGRect(origin: CGPoint(), size: dustFrame.size)
+            dustNode.frame = dustFrame
+            dustNode.update(size: dustFrame.size, color: self.dustColor, textColor: self.dustColor, rects: [rect], wordRects: [rect])
+        }
         return size
     }
     

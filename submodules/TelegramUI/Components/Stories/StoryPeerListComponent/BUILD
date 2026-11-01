@@ -71,6 +71,7 @@ swift_library(
         "//submodules/TelegramUI/Components/ChatListTitleView",
         "//submodules/TelegramUI/Components/Utils/AnimatableProperty",
         "//submodules/TelegramUI/Components/TelegramNotes",
+        "//submodules/InvisibleInkDustNode",
     ],
     visibility = [
         "//visibility:public",

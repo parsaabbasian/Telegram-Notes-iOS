@@ -4,7 +4,7 @@ import SwiftSignalKit
 import TelegramPresentationData
 
 // The Note composer: a native sheet where the text is typed straight into the speech bubble contacts will see.
-public final class TelegramNoteComposerController: UIViewController, UITextViewDelegate, UIAdaptivePresentationControllerDelegate {
+public final class TelegramNoteComposerController: UIViewController, UITextViewDelegate, UITextFieldDelegate, UIAdaptivePresentationControllerDelegate {
     private static let emojiShortcuts = ["😊", "🔥", "❤️", "🎉"]
 
     private let store: TelegramNotesStore
@@ -24,34 +24,25 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
     private let cancelButton = UIButton(type: .system)
 
     private var stateDisposable: Disposable?
+    private var audienceDisposable: Disposable?
 
-    // Telegram's own window routes touches only to its node hierarchy, so a UIKit sheet presented inside it never
-    // receives them. The composer gets a window of its own, which goes away when the sheet is dismissed.
-    private static var hostWindow: UIWindow?
-    
+    private let bubbleView = UIView()
+    private let audienceButton = UIButton(type: .system)
+    private let timerButton = UIButton(type: .system)
+    private let spoilerButton = UIButton(type: .system)
+    private let pollButton = UIButton(type: .system)
+    private let pollStack = UIStackView()
+    private let pollFields = [UITextField(), UITextField()]
+    private var options = TelegramNoteOptions()
+    private var audiences: [TelegramNoteAudience] = [.contacts, .closeFriends]
+    private var isSharing = false
+
     public static func present(store: TelegramNotesStore, theme: PresentationTheme, windowScene: UIWindowScene) {
-        if self.hostWindow != nil {
-            return
-        }
-        let window = UIWindow(windowScene: windowScene)
-        window.backgroundColor = .clear
-        window.windowLevel = .normal + 1.0
-        let rootController = UIViewController()
-        rootController.view.backgroundColor = .clear
-        window.rootViewController = rootController
-        window.makeKeyAndVisible()
-        self.hostWindow = window
-        
         let composer = TelegramNoteComposerController(store: store, theme: theme)
         composer.presentationController?.delegate = composer
-        rootController.present(composer, animated: true)
+        TelegramNoteHostWindow.present(composer, windowScene: windowScene)
     }
-    
-    private static func removeHostWindow() {
-        self.hostWindow?.isHidden = true
-        self.hostWindow = nil
-    }
-    
+
     public init(store: TelegramNotesStore, theme: PresentationTheme) {
         self.store = store
         self.theme = theme
@@ -72,6 +63,7 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
 
     deinit {
         self.stateDisposable?.dispose()
+        self.audienceDisposable?.dispose()
     }
 
     override public func viewDidLoad() {
@@ -79,7 +71,7 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
 
         let theme = self.theme
         let accent = theme.list.itemAccentColor
-        self.view.backgroundColor = theme.list.plainBackgroundColor
+        self.view.backgroundColor = theme.list.blocksBackgroundColor
         self.view.accessibilityLabel = TelegramNotesStrings.string("NotesTitle")
         self.overrideUserInterfaceStyle = theme.overallDarkAppearance ? .dark : .light
 
@@ -94,7 +86,7 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
         self.cancelButton.addTarget(self, action: #selector(self.cancelPressed), for: .touchUpInside)
 
         let titleLabel = UILabel()
-        titleLabel.text = TelegramNotesStrings.string(self.store.accountNote == nil ? "NotesNew" : "NotesEdit")
+        titleLabel.text = TelegramNotesStrings.string(self.store.accountNote == nil ? "NotesNew" : "NotesEditTitle")
         titleLabel.font = UIFont.systemFont(ofSize: 17.0, weight: .semibold)
         titleLabel.textColor = theme.list.itemPrimaryTextColor
         titleLabel.accessibilityTraits = .header
@@ -124,7 +116,7 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
         ])
 
         // The Note itself: what you type is exactly what your contacts read.
-        let bubble = UIView()
+        let bubble = self.bubbleView
         bubble.backgroundColor = theme.list.itemBlocksBackgroundColor
         bubble.layer.cornerRadius = 26.0
         bubble.layer.cornerCurve = .continuous
@@ -181,10 +173,46 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
         }
         dots.isAccessibilityElement = false
 
-        self.durationLabel.text = TelegramNotesStrings.string("NotesAudience")
         self.durationLabel.font = UIFont.systemFont(ofSize: 14.0, weight: .medium)
         self.durationLabel.textColor = theme.list.itemSecondaryTextColor
         self.durationLabel.textAlignment = .center
+
+        if let note = self.store.accountNote {
+            self.options = TelegramNoteOptions(period: note.expirationTimestamp - note.timestamp, isSpoiler: note.isSpoiler, pollOptions: note.poll?.options, audience: note.audience)
+        }
+
+        let chips = UIStackView(arrangedSubviews: [self.audienceButton, self.timerButton, self.spoilerButton, self.pollButton])
+        chips.axis = .horizontal
+        chips.spacing = 6.0
+        chips.isHidden = !self.store.supportsNoteOptions
+        self.audienceButton.showsMenuAsPrimaryAction = true
+        // A long folder name gives way first, so the row of chips always fits.
+        self.audienceButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        self.audienceButton.accessibilityLabel = TelegramNotesStrings.string("NotesAudienceHint")
+        self.timerButton.showsMenuAsPrimaryAction = true
+        self.timerButton.accessibilityLabel = TelegramNotesStrings.string("NotesTimerHint")
+        self.spoilerButton.addTarget(self, action: #selector(self.spoilerPressed), for: .touchUpInside)
+        self.pollButton.addTarget(self, action: #selector(self.pollPressed), for: .touchUpInside)
+
+        self.pollStack.axis = .vertical
+        self.pollStack.spacing = 8.0
+        for (index, field) in self.pollFields.enumerated() {
+            field.delegate = self
+            field.font = UIFont.systemFont(ofSize: 16.0)
+            field.textColor = theme.list.itemPrimaryTextColor
+            field.tintColor = accent
+            field.backgroundColor = theme.list.itemBlocksBackgroundColor
+            field.layer.cornerRadius = 12.0
+            field.layer.cornerCurve = .continuous
+            field.attributedPlaceholder = NSAttributedString(string: TelegramNotesStrings.string(index == 0 ? "NotesPollOption1" : "NotesPollOption2"), attributes: [.foregroundColor: theme.list.itemPlaceholderTextColor])
+            field.leftView = UIView(frame: CGRect(x: 0.0, y: 0.0, width: 14.0, height: 40.0))
+            field.leftViewMode = .always
+            field.returnKeyType = .done
+            field.text = self.options.pollOptions.flatMap { $0.indices.contains(index) ? $0[index] : nil }
+            field.heightAnchor.constraint(equalToConstant: 40.0).isActive = true
+            field.addTarget(self, action: #selector(self.pollFieldChanged), for: .editingChanged)
+            self.pollStack.addArrangedSubview(field)
+        }
 
         self.emojiStack.axis = .horizontal
         self.emojiStack.spacing = 10.0
@@ -236,7 +264,12 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
         self.deleteButton.isHidden = self.store.accountNote == nil
         self.deleteButton.addTarget(self, action: #selector(self.deletePressed), for: .touchUpInside)
 
-        for view in [header, bubble, dots, self.durationLabel, self.emojiStack, self.statusLabel, self.deleteButton] {
+        let lowerStack = UIStackView(arrangedSubviews: [self.durationLabel, chips, self.pollStack, self.emojiStack, self.statusLabel, self.deleteButton])
+        lowerStack.axis = .vertical
+        lowerStack.alignment = .center
+        lowerStack.spacing = 12.0
+
+        for view in [header, bubble, dots, lowerStack] {
             view.translatesAutoresizingMaskIntoConstraints = false
             self.view.addSubview(view)
         }
@@ -245,23 +278,33 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
             header.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
             header.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
             header.topAnchor.constraint(equalTo: self.view.topAnchor, constant: 16.0),
-            bubble.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 32.0),
+            bubble.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 24.0),
             bubble.centerXAnchor.constraint(equalTo: self.view.centerXAnchor),
             bubble.widthAnchor.constraint(equalTo: guide.widthAnchor, multiplier: 0.92),
             dots.topAnchor.constraint(equalTo: bubble.bottomAnchor, constant: 6.0),
             dots.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 42.0),
             dots.heightAnchor.constraint(equalToConstant: 22.0),
             dots.widthAnchor.constraint(equalToConstant: 26.0),
-            self.durationLabel.topAnchor.constraint(equalTo: dots.bottomAnchor, constant: 8.0),
-            self.durationLabel.centerXAnchor.constraint(equalTo: self.view.centerXAnchor),
-            self.emojiStack.topAnchor.constraint(equalTo: self.durationLabel.bottomAnchor, constant: 18.0),
-            self.emojiStack.centerXAnchor.constraint(equalTo: self.view.centerXAnchor),
-            self.statusLabel.topAnchor.constraint(equalTo: self.emojiStack.bottomAnchor, constant: 10.0),
-            self.statusLabel.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
-            self.statusLabel.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
-            self.deleteButton.topAnchor.constraint(equalTo: self.statusLabel.bottomAnchor, constant: 2.0),
-            self.deleteButton.centerXAnchor.constraint(equalTo: self.view.centerXAnchor)
+            lowerStack.topAnchor.constraint(equalTo: dots.bottomAnchor, constant: 6.0),
+            lowerStack.leadingAnchor.constraint(equalTo: guide.leadingAnchor),
+            lowerStack.trailingAnchor.constraint(equalTo: guide.trailingAnchor),
+            chips.widthAnchor.constraint(lessThanOrEqualTo: lowerStack.widthAnchor),
+            self.pollStack.widthAnchor.constraint(equalTo: lowerStack.widthAnchor, multiplier: 0.92),
+            self.statusLabel.widthAnchor.constraint(equalTo: lowerStack.widthAnchor)
         ])
+
+        self.audienceDisposable = (self.store.audienceOptions()
+        |> deliverOnMainQueue).start(next: { [weak self] audiences in
+            guard let self else {
+                return
+            }
+            self.audiences = audiences
+            if !audiences.contains(self.options.audience) {
+                self.audiences.append(self.options.audience)
+            }
+            self.updateOptionControls()
+        })
+        self.updateOptionControls()
 
         self.stateDisposable = (self.store.publishStateSignal
         |> deliverOnMainQueue).start(next: { [weak self] state in
@@ -279,45 +322,77 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
     override public func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         if self.presentingViewController == nil {
-            TelegramNoteComposerController.removeHostWindow()
+            TelegramNoteHostWindow.remove()
         }
     }
     
     public func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
-        TelegramNoteComposerController.removeHostWindow()
+        TelegramNoteHostWindow.remove()
     }
     
+    override public func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // Focused here so the keyboard rises with the sheet, not after it.
+        self.textView.becomeFirstResponder()
+    }
+
     override public func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         self.textView.becomeFirstResponder()
+#if DEBUG
         self.runDemoScriptIfNeeded()
+#endif
     }
 
-    // Records the concept video at an even pace: Documents/demo-script.txt holds the Note to type and share.
+#if DEBUG
+    // Records the concept video at an even pace. Documents/demo-script.txt holds the Note on its first line, then
+    // one option per line: spoiler, timer=<seconds> or audience=<name>.
     private func runDemoScriptIfNeeded() {
         guard TelegramNotesStore.isDemoMode, let script = try? String(contentsOfFile: NSHomeDirectory() + "/Documents/demo-script.txt", encoding: .utf8) else {
             return
         }
-        let characters = Array(script.trimmingCharacters(in: .whitespacesAndNewlines))
-        if characters.isEmpty {
+        var lines = script.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        if lines.isEmpty {
             return
         }
+        let characters = Array(lines.removeFirst())
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-            self?.typeDemoCharacter(characters, index: 0)
+            self?.typeDemoCharacter(characters, index: 0, steps: lines)
         }
     }
 
-    private func typeDemoCharacter(_ characters: [Character], index: Int) {
+    private func typeDemoCharacter(_ characters: [Character], index: Int, steps: [String]) {
         if index >= characters.count {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
-                self?.pressShareForDemo()
-            }
+            self.runDemoStep(steps, index: 0)
             return
         }
         self.textView.insertText(String(characters[index]))
         let pace: [Double] = [0.14, 0.18, 0.12, 0.2, 0.15]
         DispatchQueue.main.asyncAfter(deadline: .now() + pace[index % pace.count]) { [weak self] in
-            self?.typeDemoCharacter(characters, index: index + 1)
+            self?.typeDemoCharacter(characters, index: index + 1, steps: steps)
+        }
+    }
+
+    private func runDemoStep(_ steps: [String], index: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            guard let self else {
+                return
+            }
+            if index >= steps.count {
+                self.pressShareForDemo()
+                return
+            }
+            let step = steps[index]
+            if step == "spoiler" {
+                self.spoilerPressed()
+            } else if step.hasPrefix("timer="), let period = Int32(step.dropFirst(6)) {
+                self.options.period = period
+                self.updateOptionControls()
+            } else if step.hasPrefix("audience="), let audience = self.audiences.first(where: { $0.title == step.dropFirst(9) }) {
+                self.options.audience = audience
+                self.updateOptionControls()
+            }
+            self.runDemoStep(steps, index: index + 1)
         }
     }
 
@@ -331,6 +406,7 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
             self.sharePressed()
         })
     }
+#endif
 
     private func updateState(_ state: TelegramNotesStore.PublishState) {
         switch state {
@@ -360,12 +436,14 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
     }
 
     private func updateShareButton() {
-        self.shareButton.isEnabled = TelegramNoteCaption.validated(self.textView.text) != nil && self.store.publishState != .publishing
+        self.shareButton.isEnabled = TelegramNoteCaption.validated(self.textView.text) != nil && self.options.isValid && self.store.publishState != .publishing
     }
 
     private func textDidChange() {
         let length = TelegramNoteCaption.length(self.textView.text)
         self.placeholderLabel.isHidden = !self.textView.text.isEmpty
+        // Centered text puts the cursor in the middle of the placeholder, so it stays hidden until there is text.
+        self.textView.tintColor = self.textView.text.isEmpty ? .clear : self.theme.list.itemAccentColor
         self.updateShareButton()
         if self.store.publishState == .failed || self.store.publishState == .unavailable {
             self.updateState(.idle)
@@ -407,18 +485,221 @@ public final class TelegramNoteComposerController: UIViewController, UITextViewD
         UISelectionFeedbackGenerator().selectionChanged()
     }
 
+    private func timerTitle(period: Int32, short: Bool) -> String {
+        switch period {
+        case 1 * 60 * 60:
+            return short ? "1h" : TelegramNotesStrings.string("NotesTimer1h")
+        case 8 * 60 * 60:
+            return short ? "8h" : TelegramNotesStrings.string("NotesTimer8h")
+        case 72 * 60 * 60:
+            return short ? "3d" : TelegramNotesStrings.string("NotesTimer72h")
+        default:
+            return short ? "24h" : TelegramNotesStrings.string("NotesTimer24h")
+        }
+    }
+
+    private func configureChip(_ button: UIButton, symbol: String, title: String, isSelected: Bool) {
+        var configuration = UIButton.Configuration.filled()
+        configuration.image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold))
+        configuration.imagePadding = 5.0
+        configuration.title = title
+        configuration.cornerStyle = .capsule
+        configuration.baseBackgroundColor = isSelected ? self.theme.list.itemAccentColor : self.theme.list.itemBlocksBackgroundColor
+        configuration.baseForegroundColor = isSelected ? self.theme.list.itemCheckColors.foregroundColor : self.theme.list.itemPrimaryTextColor
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 7.0, leading: 11.0, bottom: 7.0, trailing: 11.0)
+        configuration.titleLineBreakMode = .byTruncatingTail
+        configuration.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = UIFont.systemFont(ofSize: 13.0, weight: .semibold)
+            return attributes
+        }
+        button.configuration = configuration
+        button.accessibilityTraits = isSelected ? [.button, .selected] : .button
+    }
+
+    private func updateOptionControls() {
+        let options = self.options
+        let isFolder: Bool
+        if case .folder = options.audience {
+            isFolder = true
+        } else {
+            isFolder = false
+        }
+        self.configureChip(self.audienceButton, symbol: isFolder ? "folder.fill" : (options.audience == .closeFriends ? "star.fill" : "person.2.fill"), title: options.audience.title, isSelected: options.audience != .contacts)
+        self.configureChip(self.timerButton, symbol: "timer", title: self.timerTitle(period: options.period, short: true), isSelected: options.period != TelegramNoteCaption.period)
+        self.configureChip(self.spoilerButton, symbol: "sparkles", title: TelegramNotesStrings.string("NotesSpoiler"), isSelected: options.isSpoiler)
+        self.configureChip(self.pollButton, symbol: "chart.bar.fill", title: TelegramNotesStrings.string("NotesPoll"), isSelected: options.pollOptions != nil)
+
+        self.audienceButton.menu = UIMenu(title: TelegramNotesStrings.string("NotesAudienceHint"), children: self.audiences.map { audience in
+            return UIAction(title: audience.title, state: audience == options.audience ? .on : .off, handler: { [weak self] _ in
+                self?.options.audience = audience
+                self?.optionChanged()
+            })
+        })
+        self.timerButton.menu = UIMenu(title: TelegramNotesStrings.string("NotesTimerHint"), children: TelegramNoteOptions.periods.map { period in
+            return UIAction(title: self.timerTitle(period: period, short: false), state: period == options.period ? .on : .off, handler: { [weak self] _ in
+                self?.options.period = period
+                self?.optionChanged()
+            })
+        })
+
+        var summary = "\(options.audience.title) · \(self.timerTitle(period: options.period, short: false))"
+        if options.isSpoiler {
+            summary += " · \(TelegramNotesStrings.string("NotesSpoilerHint"))"
+        }
+        self.durationLabel.text = summary
+        self.pollStack.isHidden = options.pollOptions == nil
+        self.updateShareButton()
+    }
+
+    private func optionChanged() {
+        UISelectionFeedbackGenerator().selectionChanged()
+        self.updateOptionControls()
+    }
+
+    // A spoiler hides the text and a poll asks about it, so a Note is one or the other.
+    @objc private func spoilerPressed() {
+        self.options.isSpoiler.toggle()
+        if self.options.isSpoiler {
+            self.options.pollOptions = nil
+        }
+        self.optionChanged()
+    }
+
+    @objc private func pollPressed() {
+        if self.options.pollOptions == nil {
+            self.options.isSpoiler = false
+            self.options.pollOptions = self.pollFields.map { $0.text ?? "" }
+            self.optionChanged()
+            self.pollFields[0].becomeFirstResponder()
+        } else {
+            self.options.pollOptions = nil
+            self.optionChanged()
+            self.textView.becomeFirstResponder()
+        }
+    }
+
+    @objc private func pollFieldChanged() {
+        self.options.pollOptions = self.pollFields.map { $0.text ?? "" }
+        self.updateShareButton()
+    }
+
+    public func textField(_ textField: UITextField, shouldChangeCharactersIn range: NSRange, replacementString string: String) -> Bool {
+        let updated = ((textField.text ?? "") as NSString).replacingCharacters(in: range, with: string)
+        return updated.utf16.count <= TelegramNoteOptions.maxPollOptionLength || string.isEmpty
+    }
+
+    public func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === self.pollFields[0] {
+            self.pollFields[1].becomeFirstResponder()
+        } else {
+            self.textView.becomeFirstResponder()
+        }
+        return false
+    }
+
     @objc private func sharePressed() {
-        self.store.publish(text: self.textView.text, theme: self.theme, completion: { [weak self] success in
+        // The keyboard shortcut reaches this without the button, and a second tap can land while the sheet closes.
+        guard self.shareButton.isEnabled, !self.isSharing else {
+            return
+        }
+        self.isSharing = true
+        let text = self.textView.text ?? ""
+        let options = self.options
+        self.store.publish(text: text, theme: self.theme, completion: { [weak self] success in
             guard let self else {
                 return
             }
-            if success {
+            if !success {
+                self.isSharing = false
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            } else if TelegramNotesStore.isDemoMode, let validated = TelegramNoteCaption.validated(text) {
+                self.flyNoteToAvatar(text: validated, options: options)
+            } else {
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
                 self.dismiss(animated: true)
-            } else {
-                UINotificationFeedbackGenerator().notificationOccurred(.error)
             }
         })
+    }
+
+    // The Note leaves the sheet as a bubble, shrinks on an arc into the row and lands on the avatar.
+    private func flyNoteToAvatar(text: String, options: TelegramNoteOptions) {
+        let store = self.store
+        let land = {
+            store.landDemoNote(text: text, options: options)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
+        guard !UIAccessibility.isReduceMotionEnabled, let window = self.view.window, let target = store.accountBubbleView, target.window != nil else {
+            self.dismiss(animated: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: land)
+            return
+        }
+
+        let startFrame = self.bubbleView.convert(self.bubbleView.bounds, to: nil)
+        let targetFrame = target.convert(target.bounds, to: nil)
+        let bubbleFont = UIFont.systemFont(ofSize: 24.0, weight: .semibold)
+        let rowFontSize: CGFloat = 10.5
+
+        let flying = UIView(frame: startFrame)
+        flying.isUserInteractionEnabled = false
+        flying.layer.shadowColor = UIColor.black.cgColor
+        flying.layer.shadowOpacity = self.theme.overallDarkAppearance ? 0.5 : 0.2
+        flying.layer.shadowRadius = 12.0
+        flying.layer.shadowOffset = CGSize(width: 0.0, height: 5.0)
+
+        let clip = UIView(frame: flying.bounds)
+        clip.backgroundColor = self.bubbleView.backgroundColor
+        clip.layer.cornerRadius = 26.0
+        clip.layer.cornerCurve = .continuous
+        clip.clipsToBounds = true
+        flying.addSubview(clip)
+
+        let label = UILabel()
+        label.text = text
+        label.font = bubbleFont
+        label.textColor = self.theme.list.itemPrimaryTextColor
+        label.textAlignment = .center
+        label.numberOfLines = 3
+        let labelSize = label.sizeThatFits(CGSize(width: startFrame.width - 40.0, height: startFrame.height))
+        label.bounds = CGRect(origin: CGPoint(), size: labelSize)
+        label.center = CGPoint(x: startFrame.width * 0.5, y: startFrame.height * 0.5)
+        clip.addSubview(label)
+        window.addSubview(flying)
+
+        self.bubbleView.alpha = 0.0
+        TelegramNoteHostWindow.isHoldingForFlight = true
+        self.dismiss(animated: true)
+
+        let rowTextWidth = ceil((text as NSString).size(withAttributes: [.font: UIFont.systemFont(ofSize: rowFontSize, weight: .medium)]).width)
+        let endSize = CGSize(width: min(68.0, max(44.0, rowTextWidth + 10.0)), height: targetFrame.height)
+        let endFrame = CGRect(x: targetFrame.midX - endSize.width * 0.5, y: targetFrame.midY - endSize.height * 0.5, width: endSize.width, height: endSize.height)
+        let textScale = rowFontSize / bubbleFont.pointSize
+
+        let arc = CAKeyframeAnimation(keyPath: "position.y")
+        arc.values = [0.0, -34.0, 0.0]
+        arc.keyTimes = [0.0, 0.45, 1.0]
+        arc.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .easeIn)]
+        arc.isAdditive = true
+        arc.duration = 0.62
+        flying.layer.add(arc, forKey: "arc")
+
+        let animator = UIViewPropertyAnimator(duration: 0.62, controlPoint1: CGPoint(x: 0.34, y: 0.0), controlPoint2: CGPoint(x: 0.16, y: 1.0), animations: {
+            flying.frame = endFrame
+            clip.frame = CGRect(origin: CGPoint(), size: endFrame.size)
+            clip.layer.cornerRadius = endFrame.height * 0.5
+            label.center = CGPoint(x: endFrame.width * 0.5, y: endFrame.height * 0.5)
+            label.transform = CGAffineTransform(scaleX: textScale, y: textScale)
+        })
+        animator.addCompletion { _ in
+            land()
+            UIView.animate(withDuration: 0.14, delay: 0.03, options: [], animations: {
+                flying.alpha = 0.0
+            }, completion: { _ in
+                flying.removeFromSuperview()
+                TelegramNoteHostWindow.endFlight()
+            })
+        }
+        animator.startAnimation()
     }
 
     @objc private func deletePressed() {

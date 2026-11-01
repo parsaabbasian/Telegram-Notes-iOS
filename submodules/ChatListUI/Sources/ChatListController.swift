@@ -3190,6 +3190,9 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
             TelegramNotesStore.shared(context: self.context).openComposer = { [weak self] in
                 self?.openNoteComposer()
             }
+            TelegramNotesStore.shared(context: self.context).openNoteCard = { [weak self] peer in
+                self?.openNoteCard(peer: peer)
+            }
         }
         
         if case .chatList = self.location, let componentView = self.chatListHeaderView() {
@@ -4384,6 +4387,15 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
                 }
             )
         }))
+    }
+    
+    func openNoteCard(peer: EnginePeer) {
+        let store = TelegramNotesStore.shared(context: self.context)
+        guard let windowScene = self.view.window?.windowScene, let note = store.notes[peer.id] else {
+            return
+        }
+        let avatarImage = TelegramNotesStore.demoAvatarImage(peerId: peer.id, accountPeerId: self.context.account.peerId)
+        TelegramNoteCardController.present(store: store, theme: self.presentationData.theme, note: note, peerTitle: peer.compactDisplayTitle, avatarImage: avatarImage, windowScene: windowScene)
     }
     
     func openNoteComposer() {
