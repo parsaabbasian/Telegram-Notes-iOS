@@ -1,4 +1,5 @@
 import Foundation
+import TelegramNotes
 import UIKit
 import TelegramCore
 import TelegramPresentationData
@@ -920,7 +921,8 @@ func chatListNodeEntriesForView(view: EngineChatList, state: ChatListNodeState, 
         }
         
         if !view.hasLater, case .chatList = mode {
-            for groupReference in groupItems {
+            // The concept demo keeps real archived chats out of the recording.
+            for groupReference in groupItems where !TelegramNotesStore.isDemoMode {
                 let messageIndex = EngineMessage.Index(id: EngineMessage.Id(peerId: EnginePeer.Id(0), namespace: 0, id: 0), timestamp: 1)
                 var mappedStoryState: ChatListNodeState.StoryState?
                 if let archiveStoryState = state.archiveStoryState {

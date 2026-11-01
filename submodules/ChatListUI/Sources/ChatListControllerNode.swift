@@ -2520,10 +2520,9 @@ func shouldDisplayStoriesInChatListHeader(storySubscriptions: EngineStorySubscri
     if !storySubscriptions.items.isEmpty {
         return true
     }
-    if !isHidden, let accountItem = storySubscriptions.accountItem {
-        if accountItem.hasPending || accountItem.storyCount != 0 {
-            return true
-        }
+    // The row stays visible in the main list so the account's "Add a note" bubble is always reachable.
+    if !isHidden, storySubscriptions.accountItem != nil {
+        return true
     }
     return false
 }

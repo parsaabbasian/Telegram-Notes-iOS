@@ -70,6 +70,7 @@ swift_library(
         "//submodules/Components/HierarchyTrackingLayer",
         "//submodules/TelegramUI/Components/ChatListTitleView",
         "//submodules/TelegramUI/Components/Utils/AnimatableProperty",
+        "//submodules/TelegramUI/Components/TelegramNotes",
     ],
     visibility = [
         "//visibility:public",

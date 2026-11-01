@@ -1,4 +1,5 @@
 import Foundation
+import TelegramNotes
 import UIKit
 import Display
 import ComponentFlow
@@ -352,6 +353,9 @@ public final class StoryPeerListComponent: Component {
         private var component: StoryPeerListComponent?
         private weak var state: EmptyComponentState?
         
+        private var notesDisposable: Disposable?
+        private var notes: [EnginePeer.Id: TelegramNote] = [:]
+        
         private var requestedLoadMoreToken: String?
         private let loadMoreDisposable = MetaDisposable()
         
@@ -446,6 +450,7 @@ public final class StoryPeerListComponent: Component {
         }
         
         deinit {
+            self.notesDisposable?.dispose()
             self.loadMoreDisposable.dispose()
             self.previewedItemDisposable?.dispose()
             self.loadingItemDisposable?.dispose()
@@ -1231,7 +1236,11 @@ public final class StoryPeerListComponent: Component {
                         rightNeighborDistance: rightNeighborDistance,
                         composeContentOffset: composeContentOffset,
                         action: component.peerAction,
-                        contextGesture: component.contextPeerAction
+                        contextGesture: component.contextPeerAction,
+                        note: self.note(peer: peer, component: component),
+                        noteAction: { [weak self] peer in
+                            self?.noteAction(peer: peer)
+                        }
                     )),
                     environment: {},
                     containerSize: itemLayout.itemSize
@@ -1626,7 +1635,65 @@ public final class StoryPeerListComponent: Component {
             return result
         }
         
+        private func note(peer: EnginePeer, component: StoryPeerListComponent) -> StoryPeerListItemComponent.Note? {
+            if component.useHiddenList {
+                return nil
+            }
+            let isAccount = peer.id == component.context.account.peerId
+            if let note = self.notes[peer.id] {
+                let label: String
+                if isAccount {
+                    label = "\(TelegramNotesStrings.string("NotesEdit")): \(note.text)"
+                } else {
+                    label = "\(peer.compactDisplayTitle): \(note.text)"
+                }
+                return StoryPeerListItemComponent.Note(text: note.text, isPlaceholder: false, storyId: note.storyId, accessibilityLabel: label)
+            } else if isAccount {
+                let text = TelegramNotesStrings.string("NotesAdd")
+                return StoryPeerListItemComponent.Note(text: text, isPlaceholder: true, storyId: nil, accessibilityLabel: text)
+            }
+            return nil
+        }
+        
+        private func noteAction(peer: EnginePeer) {
+            guard let component = self.component else {
+                return
+            }
+            if peer.id == component.context.account.peerId {
+                TelegramNotesStore.shared(context: component.context).openComposer?()
+            } else if !TelegramNotesStore.isDemoMode {
+                // A contact's Note is a Story, so it opens in the Story viewer with its reply composer.
+                component.peerAction(peer)
+            }
+        }
+        
+        private func subscribeToNotesIfNeeded(component: StoryPeerListComponent) {
+            if self.notesDisposable != nil || component.useHiddenList {
+                return
+            }
+            let store = TelegramNotesStore.shared(context: component.context)
+            let accountPeerId = component.context.account.peerId
+            self.notesDisposable = (store.notesSignal
+            |> deliverOnMainQueue).start(next: { [weak self] notes in
+                guard let self else {
+                    return
+                }
+                var hasNewContactNote = false
+                for note in notes.values where note.peerId != accountPeerId {
+                    if store.markBubbleSeen(storyId: note.storyId) {
+                        hasNewContactNote = true
+                    }
+                }
+                self.notes = notes
+                if hasNewContactNote && self.window != nil {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                }
+                self.state?.updated(transition: UIAccessibility.isReduceMotionEnabled ? .immediate : .spring(duration: 0.4))
+            })
+        }
+        
         func update(component: StoryPeerListComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
+            self.subscribeToNotesIfNeeded(component: component)
             let incomingAnimation = transition.animation
             var transition = transition
             transition.animation = .none

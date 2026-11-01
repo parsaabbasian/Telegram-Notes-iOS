@@ -631,6 +631,9 @@ def build(bazel, arguments):
     )
 
     bazel_command_line.set_configuration(arguments.configuration)
+    # The simulator ignores code signing, so a simulator build needs no provisioning profile.
+    if arguments.configuration.endswith('sim_arm64'):
+        bazel_command_line.set_disable_provisioning_profiles()
     if arguments.embedWatchApp:
         if arguments.configuration in ('debug_arm64', 'release_arm64'):
             if arguments.watchApiId is None or arguments.watchApiHash is None:

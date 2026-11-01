@@ -1,4 +1,5 @@
 import Foundation
+import TelegramNotes
 import UIKit
 import Postbox
 import SwiftSignalKit
@@ -2205,6 +2206,11 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
                             items.append(item)
                         }
                     }
+                    if TelegramNotesStore.isDemoMode, case .chatList(.root) = self.location {
+                        for peer in TelegramNotesStore.demoContactPeers where !items.contains(where: { $0.peer.id == peer.id }) {
+                            items.append(EngineStorySubscriptions.Item(peer: peer, hasUnseen: true, hasUnseenCloseFriends: false, hasLiveItems: false, hasPending: false, storyCount: 1, unseenCount: 1, lastTimestamp: 0))
+                        }
+                    }
                     self.orderedStorySubscriptions = EngineStorySubscriptions(
                         accountItem: rawStorySubscriptions.accountItem,
                         items: items,
@@ -2301,6 +2307,9 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
     
     private weak var storyTooltip: TooltipScreen?
     fileprivate func maybeDisplayStoryTooltip() {
+        if TelegramNotesStore.isDemoMode {
+            return
+        }
         let content = self.updateHeaderContent()
         if content.secondaryContent != nil {
             return
@@ -3175,6 +3184,12 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
         
         if layout.inVoiceOver != wasInVoiceOver {
             self.chatListDisplayNode.scrollToTop()
+        }
+        
+        if case .chatList(.root) = self.location {
+            TelegramNotesStore.shared(context: self.context).openComposer = { [weak self] in
+                self?.openNoteComposer()
+            }
         }
         
         if case .chatList = self.location, let componentView = self.chatListHeaderView() {
@@ -4369,6 +4384,14 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
                 }
             )
         }))
+    }
+    
+    func openNoteComposer() {
+        let store = TelegramNotesStore.shared(context: self.context)
+        guard let windowScene = self.view.window?.windowScene else {
+            return
+        }
+        TelegramNoteComposerController.present(store: store, theme: self.presentationData.theme, windowScene: windowScene)
     }
     
     public func openStories(peerId: EnginePeer.Id) {

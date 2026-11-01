@@ -1,4 +1,5 @@
 import Foundation
+import TelegramNotes
 import UIKit
 import Display
 import ComponentFlow
@@ -385,6 +386,23 @@ public final class StoryPeerListItemComponent: Component {
     public let composeContentOffset: CGFloat?
     public let action: (EnginePeer) -> Void
     public let contextGesture: (ContextExtractedContentContainingNode, ContextGesture, EnginePeer) -> Void
+    public let note: Note?
+    public let noteAction: ((EnginePeer) -> Void)?
+    
+    // A Telegram Note shown as a speech bubble over the avatar; the account's own item shows a placeholder to add one.
+    public struct Note: Equatable {
+        public let text: String
+        public let isPlaceholder: Bool
+        public let storyId: Int32?
+        public let accessibilityLabel: String
+        
+        public init(text: String, isPlaceholder: Bool, storyId: Int32?, accessibilityLabel: String) {
+            self.text = text
+            self.isPlaceholder = isPlaceholder
+            self.storyId = storyId
+            self.accessibilityLabel = accessibilityLabel
+        }
+    }
     
     public init(
         context: AccountContext,
@@ -405,7 +423,9 @@ public final class StoryPeerListItemComponent: Component {
         rightNeighborDistance: CGPoint?,
         composeContentOffset: CGFloat?,
         action: @escaping (EnginePeer) -> Void,
-        contextGesture: @escaping (ContextExtractedContentContainingNode, ContextGesture, EnginePeer) -> Void
+        contextGesture: @escaping (ContextExtractedContentContainingNode, ContextGesture, EnginePeer) -> Void,
+        note: Note? = nil,
+        noteAction: ((EnginePeer) -> Void)? = nil
     ) {
         self.context = context
         self.theme = theme
@@ -426,6 +446,8 @@ public final class StoryPeerListItemComponent: Component {
         self.composeContentOffset = composeContentOffset
         self.action = action
         self.contextGesture = contextGesture
+        self.note = note
+        self.noteAction = noteAction
     }
     
     public static func ==(lhs: StoryPeerListItemComponent, rhs: StoryPeerListItemComponent) -> Bool {
@@ -480,6 +502,9 @@ public final class StoryPeerListItemComponent: Component {
         if lhs.composeContentOffset != rhs.composeContentOffset {
             return false
         }
+        if lhs.note != rhs.note {
+            return false
+        }
         return true
     }
     
@@ -492,6 +517,8 @@ public final class StoryPeerListItemComponent: Component {
         
         private let button: HighlightTrackingButton
         private let titleContainer: UIView
+        private var noteBubble: StoryNoteBubbleView?
+        private var demoAvatarView: UIImageView?
         
         fileprivate var composeLayer: StoryComposeLayer?
         fileprivate let avatarContent: PortalSourceView
@@ -657,7 +684,59 @@ public final class StoryPeerListItemComponent: Component {
             guard let component = self.component else {
                 return
             }
+            if TelegramNotesStore.isDemoMode, component.note != nil {
+                self.notePressed()
+                return
+            }
             component.action(component.peer)
+        }
+        
+        @objc private func notePressed() {
+            guard let component = self.component else {
+                return
+            }
+            if let noteAction = component.noteAction {
+                noteAction(component.peer)
+            } else {
+                component.action(component.peer)
+            }
+        }
+        
+        private func updateNoteBubble(component: StoryPeerListItemComponent, previousComponent: StoryPeerListItemComponent?, avatarFrame: CGRect, effectiveScale: CGFloat, transition: ComponentTransition) {
+            guard let note = component.note else {
+                if let noteBubble = self.noteBubble {
+                    self.noteBubble = nil
+                    noteBubble.removeFromSuperview()
+                }
+                return
+            }
+            
+            let noteBubble: StoryNoteBubbleView
+            var isNew = false
+            if let current = self.noteBubble {
+                noteBubble = current
+            } else {
+                noteBubble = StoryNoteBubbleView()
+                noteBubble.addTarget(self, action: #selector(self.notePressed), for: .touchUpInside)
+                self.noteBubble = noteBubble
+                self.button.addSubview(noteBubble)
+                isNew = true
+            }
+            
+            noteBubble.update(note: note, theme: component.theme)
+            let bubbleSize = noteBubble.measure(maxWidth: avatarFrame.width + 16.0)
+            // The bubble sits on the avatar's top edge, like a thought over the contact's head.
+            let bubbleCenter = CGPoint(x: avatarFrame.midX, y: avatarFrame.minY + bubbleSize.height * 0.5 - 8.0)
+            noteBubble.bounds = CGRect(origin: CGPoint(), size: bubbleSize)
+            transition.setPosition(view: noteBubble, position: bubbleCenter)
+            transition.setScale(view: noteBubble, scale: effectiveScale)
+            transition.setAlpha(view: noteBubble, alpha: component.expandedAlphaFraction)
+            noteBubble.isUserInteractionEnabled = component.expandedAlphaFraction > 0.5
+            
+            let textChanged = previousComponent?.note?.text != note.text
+            if (isNew || textChanged) && !note.isPlaceholder && !UIAccessibility.isReduceMotionEnabled {
+                noteBubble.layer.animateSpring(from: 0.2 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.7, damping: 30.0)
+            }
         }
         
         public func transitionView() -> UIView? {
@@ -711,6 +790,21 @@ public final class StoryPeerListItemComponent: Component {
             let avatarFrame = CGRect(origin: CGPoint(x: floor((availableSize.width - avatarSize.width) * 0.5) + (effectiveWidth - availableSize.width) * 0.5, y: 4.0), size: avatarSize)
             
             transition.setFrame(view: avatarNode.view, frame: CGRect(origin: CGPoint(), size: avatarFrame.size))
+            if let demoAvatarImage = TelegramNotesStore.demoAvatarImage(peerId: component.peer.id, accountPeerId: component.context.account.peerId) {
+                let demoAvatarView: UIImageView
+                if let current = self.demoAvatarView {
+                    demoAvatarView = current
+                } else {
+                    demoAvatarView = UIImageView()
+                    self.demoAvatarView = demoAvatarView
+                    avatarNode.view.addSubview(demoAvatarView)
+                }
+                demoAvatarView.image = demoAvatarImage
+                demoAvatarView.frame = CGRect(origin: CGPoint(), size: avatarFrame.size)
+            } else if let demoAvatarView = self.demoAvatarView {
+                self.demoAvatarView = nil
+                demoAvatarView.removeFromSuperview()
+            }
             transition.setFrame(view: self.avatarBackgroundView, frame: CGRect(origin: CGPoint(), size: avatarFrame.size).insetBy(dx: -3.0 - UIScreenPixel * 2.0, dy: -3.0 - UIScreenPixel * 2.0))
             
             let indicatorFrame = avatarFrame.insetBy(dx: -8.0, dy: -8.0)
@@ -874,6 +968,12 @@ public final class StoryPeerListItemComponent: Component {
                 }
             }
             
+            if TelegramNotesStore.demoAvatarImage(peerId: component.peer.id, accountPeerId: component.context.account.peerId) != nil {
+                // In the concept a Note is not a Story, so the avatar carries no Story ring.
+                self.indicatorColorSeenLayer.isHidden = true
+                self.indicatorColorUnseenLayer.isHidden = true
+            }
+            
             self.avatarBackgroundView.isHidden = component.ringAnimation != nil || self.indicatorColorSeenLayer.isHidden
             
             let baseRadius: CGFloat = 30.66
@@ -956,7 +1056,7 @@ public final class StoryPeerListItemComponent: Component {
                 if let ringAnimation = component.ringAnimation, case .progress = ringAnimation {
                     titleString = component.strings.StoryFeed_MyUploading
                 } else {
-                    titleString = component.strings.StoryFeed_MyStory
+                    titleString = TelegramNotesStrings.string("NotesYours")
                 }
             } else {
                 titleString = component.peer.compactDisplayTitle.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1068,6 +1168,8 @@ public final class StoryPeerListItemComponent: Component {
             titleTransition.setPosition(view: self.titleContainer, position: titleContainerFrame.center)
             self.titleContainer.bounds = CGRect(origin: CGPoint(), size: titleContainerFrame.size)
             titleTransition.setScale(view: self.titleContainer, scale: effectiveScale)
+            
+            self.updateNoteBubble(component: component, previousComponent: previousComponent, avatarFrame: avatarFrame, effectiveScale: effectiveScale, transition: transition)
             titleTransition.setAlpha(view: self.titleContainer, alpha: component.expandedAlphaFraction)
             
             if let ringAnimation = component.ringAnimation {
@@ -1174,5 +1276,64 @@ public final class StoryPeerListItemComponent: Component {
     
     public func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
         return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
+    }
+}
+
+// The speech bubble a Note is drawn in. The account's placeholder uses the accent color, contacts' Notes use the item background.
+private final class StoryNoteBubbleView: UIControl {
+    private let backgroundView = UIView()
+    private let label = UILabel()
+    private var isPlaceholder = false
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        
+        self.backgroundView.isUserInteractionEnabled = false
+        self.backgroundView.layer.shadowColor = UIColor.black.cgColor
+        self.backgroundView.layer.shadowOpacity = 0.18
+        self.backgroundView.layer.shadowRadius = 3.0
+        self.backgroundView.layer.shadowOffset = CGSize(width: 0.0, height: 1.0)
+        self.addSubview(self.backgroundView)
+        
+        self.label.font = Font.medium(10.5)
+        self.label.textAlignment = .center
+        self.label.lineBreakMode = .byTruncatingTail
+        self.label.numberOfLines = 1
+        self.addSubview(self.label)
+        
+        self.isAccessibilityElement = true
+        self.accessibilityTraits = .button
+    }
+    
+    required init?(coder: NSCoder) {
+        preconditionFailure()
+    }
+    
+    override var isHighlighted: Bool {
+        didSet {
+            self.alpha = self.isHighlighted ? 0.6 : 1.0
+        }
+    }
+    
+    func update(note: StoryPeerListItemComponent.Note, theme: PresentationTheme) {
+        self.isPlaceholder = note.isPlaceholder
+        self.label.text = note.text
+        self.backgroundView.backgroundColor = theme.list.itemBlocksBackgroundColor
+        self.label.textColor = note.isPlaceholder ? theme.list.itemSecondaryTextColor : theme.list.itemPrimaryTextColor
+        self.accessibilityLabel = note.accessibilityLabel
+    }
+    
+    func measure(maxWidth: CGFloat) -> CGSize {
+        let textSize = self.label.sizeThatFits(CGSize(width: maxWidth - 10.0, height: 20.0))
+        let size = CGSize(width: min(maxWidth, ceil(textSize.width) + 10.0), height: 21.0)
+        self.backgroundView.frame = CGRect(origin: CGPoint(), size: size)
+        self.backgroundView.layer.cornerRadius = size.height * 0.5
+        self.label.frame = CGRect(origin: CGPoint(), size: size).insetBy(dx: 5.0, dy: 0.0)
+        return size
+    }
+    
+    // A slightly larger touch target than the drawn bubble, without stealing taps meant for the avatar below it.
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        return self.bounds.insetBy(dx: -4.0, dy: -6.0).contains(point)
     }
 }

@@ -1,4 +1,6 @@
 import Foundation
+import TelegramNotes
+import ExploreScreen
 import UIKit
 import Display
 import AsyncDisplayKit
@@ -78,10 +80,12 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
     
     public var contactsController: ContactsController?
     public var callListController: CallListController?
+    public var exploreController: ExploreScreen?
     public var chatListController: ChatListController?
     public var accountSettingsController: PeerInfoScreen?
     public var newsController: NewsScreen?
     
+    private let exploreDiscussionDisposable = MetaDisposable()
     private var permissionsDisposable: Disposable?
     private var presentationDataDisposable: Disposable?
     private var presentationData: PresentationData
@@ -144,6 +148,7 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
     }
     
     deinit {
+        self.exploreDiscussionDisposable.dispose()
         self.permissionsDisposable?.dispose()
         self.presentationDataDisposable?.dispose()
         self.applicationInFocusDisposable?.dispose()
@@ -196,6 +201,31 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
         super.containerLayoutUpdated(layout, transition: transition)
     }
     
+    private func openExploreTogetherTopic(peerId: EnginePeer.Id, topicId: Int64, messageId: EngineMessage.Id?, draft: String?) {
+        self.exploreDiscussionDisposable.set((fetchAndPreloadReplyThreadInfo(context: self.context, subject: .groupMessage(EngineMessage.Id(peerId: peerId, namespace: Namespaces.Message.Cloud, id: Int32(clamping: topicId))), atMessageId: messageId, preload: false)
+        |> deliverOnMainQueue).start(next: { [weak self] result in
+            guard let self else { return }
+            self.context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: self, context: self.context, chatLocation: .replyThread(result.message), chatLocationContextHolder: result.contextHolder, subject: messageId.map { .message(id: .id($0), highlight: nil, timecode: nil, setupReply: false) }, activateInput: draft == nil ? nil : .text, keepStack: .always, completion: { controller in
+                guard let draft, let controller = controller as? ChatControllerImpl else { return }
+                controller.updateChatPresentationInterfaceState(animated: false, interactive: true, { state in
+                    return state.updatedInterfaceState { interfaceState in
+                        let existing = interfaceState.composeInputState
+                        // Preserve existing rich-text structure and avoid duplicating a retried draft.
+                        if existing.inputText.string.hasSuffix(draft) { return interfaceState }
+                        let appended = existing.replacingFlatRange(NSRange(location: existing.inputText.length, length: 0), with: (existing.isEmpty ? "" : "\n\n") + draft)
+                        return interfaceState.withUpdatedComposeInputState(appended)
+                    }
+                })
+            }))
+        }, error: { [weak self] _ in
+            guard let self, let presenter = self.viewControllers.last else { return }
+            let alert = UIAlertController(title: "Couldn’t open topic", message: "The topic may be unavailable or offline. Nothing was sent. You can retry with the same draft.", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Retry", style: .default, handler: { [weak self] _ in self?.openExploreTogetherTopic(peerId: peerId, topicId: topicId, messageId: messageId, draft: draft) }))
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            presenter.present(alert, animated: true)
+        }))
+    }
+
     public func addRootControllers(showCallsTab: Bool, showNewsTab: Bool) {
         let tabBarController = TabBarControllerImpl(theme: self.presentationData.theme, strings: self.presentationData.strings)
         tabBarController.navigationPresentation = .master
@@ -206,6 +236,16 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
         let callListController = CallListController(context: self.context, mode: .tab)
         // Created even when hidden, like the calls tab: `updateRootControllers` shows and hides it.
         let newsController = NewsScreen(context: self.context)
+        let exploreController = ExploreScreen(context: self.context)
+        exploreController.openTogetherTopic = { [weak self] peerId, topicId, messageId, draft in
+            self?.openExploreTogetherTopic(peerId: peerId, topicId: topicId, messageId: messageId, draft: draft)
+        }
+        exploreController.openDiscussion = { [weak self] messageId in
+            guard let self else { return }
+            self.exploreDiscussionDisposable.set(ChatControllerImpl.openMessageReplies(context: self.context, navigationController: self, present: { [weak self] controller, arguments in
+                (self?.viewControllers.last as? ViewController)?.present(controller, in: .window(.root), with: arguments)
+            }, messageId: messageId, isChannelPost: true, atMessage: nil, displayModalProgress: true).start())
+        }
         
         var controllers: [ViewController] = []
         
@@ -221,6 +261,9 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
         controllers.append(chatListController)
         if showNewsTab {
             controllers.append(newsController)
+        }
+        if !TelegramNotesStore.isDemoMode {
+            controllers.append(exploreController)
         }
         
         var restoreSettignsController: (ViewController & SettingsController)?
@@ -248,6 +291,7 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
         self.contactsController = contactsController
         self.callListController = callListController
         self.newsController = newsController
+        self.exploreController = exploreController
         self.chatListController = chatListController
         self.accountSettingsController = accountSettingsController
         self.rootTabController = tabBarController
@@ -266,6 +310,9 @@ public final class TelegramRootController: NavigationController, TelegramRootCon
         controllers.append(self.chatListController!)
         if showNewsTab, let newsController = self.newsController {
             controllers.append(newsController)
+        }
+        if !TelegramNotesStore.isDemoMode, let exploreController = self.exploreController {
+            controllers.append(exploreController)
         }
         controllers.append(self.accountSettingsController!)
 
