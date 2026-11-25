@@ -1,5 +1,6 @@
 import Foundation
 import TelegramNotes
+import TelegramMemories
 import UIKit
 import Postbox
 import SwiftSignalKit
@@ -254,6 +255,8 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
     let globalControlPanelsContext: GlobalControlPanelsContext
     private(set) var globalControlPanelsContextState: GlobalControlPanelsContext.State?
     private var globalControlPanelsContextStateDisposable: Disposable?
+    private(set) var memories: [TelegramMemory] = []
+    private var memoriesDisposable: Disposable?
     
     public override func updateNavigationCustomData(_ data: Any?, progress: CGFloat, transition: ContainedViewLayoutTransition) {
         if self.isNodeLoaded {
@@ -797,6 +800,18 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
             self.globalControlPanelsContextState = state
             self.requestLayout(transition: .animated(duration: 0.4, curve: .spring))
         })
+        
+        if case .chatList(.root) = self.location {
+            // Today's memories appear as a card above the chats, in the slot Telegram uses for birthday reminders.
+            self.memoriesDisposable = (TelegramMemoriesStore.shared(context: self.context).memoriesSignal
+            |> deliverOnMainQueue).startStrict(next: { [weak self] memories in
+                guard let self, self.memories != memories else {
+                    return
+                }
+                self.memories = memories
+                self.requestLayout(transition: .animated(duration: 0.4, curve: .spring))
+            })
+        }
     }
 
     required public init(coder aDecoder: NSCoder) {
@@ -831,6 +846,7 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
             disposable.dispose()
         }
         self.globalControlPanelsContextStateDisposable?.dispose()
+        self.memoriesDisposable?.dispose()
     }
     
     private func updateNavigationMetadata() {
@@ -2386,6 +2402,11 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
     
     override public func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        
+        if case .chatList(.root) = self.location {
+            // Looks for today's memories once a day, so a chat list left open overnight finds the new day's.
+            TelegramMemoriesStore.shared(context: self.context).refresh()
+        }
                 
         if self.powerSavingMonitoringDisposable == nil {
             self.powerSavingMonitoringDisposable = (self.context.sharedContext.automaticMediaDownloadSettings
@@ -4396,6 +4417,13 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController 
         }
         let avatarImage = TelegramNotesStore.demoAvatarImage(peerId: peer.id, accountPeerId: self.context.account.peerId)
         TelegramNoteCardController.present(store: store, theme: self.presentationData.theme, note: note, peerTitle: peer.compactDisplayTitle, avatarImage: avatarImage, windowScene: windowScene)
+    }
+    
+    func openMemories(sourceView: UIView) {
+        guard let windowScene = self.view.window?.windowScene else {
+            return
+        }
+        TelegramMemoryViewerController.present(context: self.context, memories: self.memories, theme: self.presentationData.theme, sourceView: sourceView, windowScene: windowScene)
     }
     
     func openNoteComposer() {

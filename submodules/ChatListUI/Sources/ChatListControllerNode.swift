@@ -30,6 +30,7 @@ import ChatListHeaderNoticeComponent
 import ChatListFilterTabContainerNode
 import GlassControls
 import SideColumnLayout
+import TelegramMemories
 
 public enum ChatListContainerNodeFilter: Equatable {
     case all
@@ -1508,6 +1509,26 @@ final class ChatListControllerNode: ASDisplayNode, ASGestureRecognizerDelegate {
                     }
                 )))
             )
+        }
+        if let memory = self.controller?.memories.first {
+            panels.append(HeaderPanelContainerComponent.Panel(
+                key: "memory",
+                orderIndex: 3,
+                component: AnyComponent(TelegramMemoryPanelComponent(
+                    context: self.context,
+                    theme: self.presentationData.theme,
+                    memory: memory,
+                    openAction: { [weak self] sourceView in
+                        self?.controller?.openMemories(sourceView: sourceView)
+                    },
+                    dismissAction: { [weak self] in
+                        guard let self else {
+                            return
+                        }
+                        TelegramMemoriesStore.shared(context: self.context).hideForToday()
+                    }
+                ))
+            ))
         }
         if let mediaPlayback = self.controller?.globalControlPanelsContextState?.mediaPlayback {
             if let playlistLocation = mediaPlayback.playlistLocation as? PeerMessagesPlaylistLocation, case let .custom(_, _, _, _, hidePanel) = playlistLocation, hidePanel {
